@@ -1,0 +1,21 @@
+
+# class Booking(Base):
+#     __tablename__ = "bookings"
+#     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+#     user_id = Column(UUID(as_uuid=True), nullable=False)
+#     venue_id = Column(UUID(as_uuid=True), ForeignKey("venues.id"), nullable=False)
+#     booking_date = Column(DateTime, nullable=False)
+#     start_time = Column(Text, nullable=False)
+#     end_time = Column(Text, nullable=False)
+#     party_size = Column(Integer, nullable=False)
+#     special_requests = Column(Text, nullable=True)
+#     status = Column(Text, nullable=False)
+#     resource_name = Column(Text, nullable=True)
+#     created_at = Column(DateTime(timezone=True), nullable=False)
+#     updated_at = Column(DateTime(timezone=True), nullable=False)
+#     arrival_window = Column(Text, nullable=True)
+#     booking_reference = Column(Text, nullable=True)
+#     booking_type = Column(Text, nullable=True)
+#     can_cancel = Column(Boolean, nullable=True)
+#     cancel_cutoff_at = Column(DateTime(timezone=True), nullable=True)
+#     pass_status = Column(Text, nullable=True)

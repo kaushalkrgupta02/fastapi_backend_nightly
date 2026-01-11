@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Body
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, model_validator
 from typing import List, Optional
@@ -6,11 +6,14 @@ from uuid import UUID
 from datetime import datetime, timezone
 from core.get_db import get_db
 from core.auth_middleware import get_current_user
+from core.supabase_client import get_supabase_admin, SUPABASE_URL
 from models.venue import Venue, VenueTable, VenueGuestProfile
 from models.sessions import TableSession, SessionOrder, SessionOrderItem, SessionInvoice, Menu, MenuItem, VenuePOSSettings
 from models.auth import UserRole, StaffProfile, AppRole
 import uuid as uuid_module
 import logging
+import requests
+import os
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/sessions", tags=["Sessions"])
@@ -94,7 +97,8 @@ def _apply_payment(invoice, amount: float, method: Optional[str], reference: Opt
     # if all invoices for the session are paid -> close session and free table
     session = db.query(TableSession).filter(TableSession.id == invoice.session_id).one_or_none()
     if session:
-        unpaid = db.query(SessionInvoice).filter(SessionInvoice.session_id == session.id).filter(SessionInvoice.status != 'paid').count()
+        # Count unpaid invoices ignoring those explicitly voided so they don't block closure
+        unpaid = db.query(SessionInvoice).filter(SessionInvoice.session_id == session.id).filter(SessionInvoice.status != 'paid').filter(SessionInvoice.status != 'void').count()
         if unpaid == 0:
             session.status = 'closed'
             session.closed_at = datetime.now(timezone.utc)
@@ -164,18 +168,36 @@ def checkin(venue_id: UUID, payload: CheckInPayload, current_user=Depends(get_cu
 
         assert_venue_access(db, current_user_uuid, venue_id, "Not authorized to open sessions for this venue")
 
-        # table must be provided (auto-assignment disabled)
-        if not payload.table_id:
-            raise HTTPException(status_code=400, detail="table_id is required; auto-assignment is disabled")
-
-        table = db.query(VenueTable).filter(VenueTable.id == payload.table_id, VenueTable.venue_id == venue_id).one_or_none()
-        if not table:
-            raise HTTPException(status_code=404, detail="Table not found for this venue")
-        if table.status and table.status != 'available':
-            raise HTTPException(status_code=400, detail=f"Table not available (status={table.status})")
-        # verify capacity
-        if table.seats < payload.guest_count:
-            raise HTTPException(status_code=400, detail="Table seats are less than guest count")
+        # Support walk-ins: if table_id not provided, attempt auto-assignment
+        assigned_table = None
+        if payload.table_id:
+            table = db.query(VenueTable).filter(VenueTable.id == payload.table_id, VenueTable.venue_id == venue_id).one_or_none()
+            if not table:
+                raise HTTPException(status_code=404, detail="Table not found for this venue")
+            if table.status and table.status != 'available':
+                raise HTTPException(status_code=400, detail=f"Table not available (status={table.status})")
+            # verify capacity
+            if table.seats < payload.guest_count:
+                raise HTTPException(status_code=400, detail="Table seats are less than guest count")
+            assigned_table = table
+        else:
+            # Try to auto-assign a suitable available table using a row-lock to avoid races
+            sql = """
+            SELECT id FROM venue_tables
+            WHERE venue_id = :venue_id AND status = 'available' AND is_active = true AND seats >= :guest_count
+            ORDER BY seats ASC
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
+            """
+            row = db.execute(sql, {"venue_id": str(venue_id), "guest_count": payload.guest_count}).fetchone()
+            if row:
+                table_id = row[0]
+                table = db.query(VenueTable).filter(VenueTable.id == table_id).one_or_none()
+                if table:
+                    assigned_table = table
+            else:
+                # No available table found - proceed without a table (open session without assignment)
+                assigned_table = None
 
         now = datetime.now(timezone.utc)
 
@@ -203,7 +225,7 @@ def checkin(venue_id: UUID, payload: CheckInPayload, current_user=Depends(get_cu
 
         session = TableSession(
             venue_id=venue_id,
-            table_id=table.id if table else None,
+            table_id=assigned_table.id if assigned_table else None,
             booking_id=booking_id,
             package_purchase_id=package_purchase_id,
             status='open',
@@ -216,14 +238,14 @@ def checkin(venue_id: UUID, payload: CheckInPayload, current_user=Depends(get_cu
 
         db.add(session)
         # mark table reserved
-        if table:
-            table.status = 'reserved'
-            db.add(table)
+        if assigned_table:
+            assigned_table.status = 'reserved'
+            db.add(assigned_table)
 
         db.commit()
         db.refresh(session)
 
-        return {"session_id": str(session.id)}
+        return {"session_id": str(session.id), "table_id": str(assigned_table.id) if assigned_table else None}
     except HTTPException:
         raise
     except Exception as e:
@@ -254,6 +276,29 @@ def get_active_sessions(venue_id: UUID, current_user=Depends(get_current_user), 
         raise
     except Exception as e:
         logger.error(f"Get active sessions error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/venue/{venue_id}/tables/availability", response_model=dict)
+def get_table_availability(venue_id: UUID, current_user=Depends(get_current_user), db: Session = Depends(get_db)):
+    """Return table availability counts and a short list of available tables (id, table_number, seats)."""
+    try:
+        current_user_uuid = uuid_module.UUID(current_user["sub"])
+        assert_venue_access(db, current_user_uuid, venue_id, "Not authorized to view tables for this venue")
+
+        total = db.query(VenueTable).filter(VenueTable.venue_id == venue_id, VenueTable.is_active == True).count()
+        available = db.query(VenueTable).filter(VenueTable.venue_id == venue_id, VenueTable.status == 'available', VenueTable.is_active == True).count()
+        reserved = db.query(VenueTable).filter(VenueTable.venue_id == venue_id, VenueTable.status == 'reserved', VenueTable.is_active == True).count()
+        other = total - (available + reserved)
+
+        avail_list = db.query(VenueTable).filter(VenueTable.venue_id == venue_id, VenueTable.status == 'available', VenueTable.is_active == True).order_by(VenueTable.seats.asc()).limit(20).all()
+        avail_short = [{"id": str(t.id), "table_number": t.table_number, "seats": t.seats} for t in avail_list]
+
+        return {"total": total, "available": available, "reserved": reserved, "other": other, "available_tables": avail_short}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get table availability error: {e}")
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -540,6 +585,73 @@ def pay_invoice_by_id(invoice_id: UUID, payload: PaymentPayload, current_user=De
         raise HTTPException(status_code=400, detail=str(e))
 
 
+class SendInvoiceEmailPayload(BaseModel):
+    to_email: Optional[str] = None
+    subject: Optional[str] = None
+    body_overrides: Optional[dict] = None
+
+
+@router.post("/invoices/{invoice_id}/send-email", response_model=dict)
+def send_invoice_email(invoice_id: UUID, payload: SendInvoiceEmailPayload = Body(...), current_user=Depends(get_current_user), db: Session = Depends(get_db)):
+    """Proxy to Supabase Edge Function `send-invoice-email` using the service role key to avoid CORS and expose a secure server-side call."""
+    try:
+        current_user_uuid = uuid_module.UUID(current_user["sub"])
+
+        invoice = db.query(SessionInvoice).filter(SessionInvoice.id == invoice_id).one_or_none()
+        if not invoice:
+            raise HTTPException(status_code=404, detail="Invoice not found")
+
+        # confirm session and venue access
+        session = db.query(TableSession).filter(TableSession.id == invoice.session_id).one_or_none()
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found for invoice")
+
+        assert_venue_access(db, current_user_uuid, session.venue_id, "Not authorized to send invoice for this session")
+
+        # require SUPABASE_SERVICE_ROLE_KEY
+        admin = get_supabase_admin()
+        if not admin:
+            raise HTTPException(status_code=500, detail="SUPABASE_SERVICE_ROLE_KEY not configured on server; cannot call Supabase functions")
+
+        # Build function URL and payload
+        function_url = f"{SUPABASE_URL.rstrip('/')}/functions/v1/send-invoice-email"
+        srk = os.getenv('SUPABASE_SERVICE_ROLE_KEY')
+        headers = {
+            'Authorization': f'Bearer {srk}',
+            'Content-Type': 'application/json'
+        }
+
+        body = {
+            'invoice_id': str(invoice_id),
+            'venue_id': str(session.venue_id),
+            'to_email': payload.to_email,
+            'subject': payload.subject,
+            'body_overrides': payload.body_overrides
+        }
+
+        resp = requests.post(function_url, json=body, headers=headers, timeout=15)
+
+        if not resp.ok:
+            logger.error(f"Supabase function error: status={resp.status_code} body={resp.text}")
+            # Provide a clearer error message when function namespace/name cannot be found (404)
+            if resp.status_code == 404:
+                raise HTTPException(status_code=502, detail=("Supabase function 'send-invoice-email' not found (404). "
+                                                           "Ensure the function is deployed to your Supabase project and that SUPABASE_URL is correct."))
+            raise HTTPException(status_code=502, detail=(f"Supabase function error: {resp.status_code} - {resp.text}"))
+
+        try:
+            data = resp.json()
+        except Exception:
+            data = { 'success': True }
+
+        return data
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Send invoice email error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 class AdminForcePayload(BaseModel):
     mark_orders_served: Optional[bool] = True
     mark_invoices_paid: Optional[bool] = True
@@ -627,6 +739,47 @@ def admin_force_close(session_id: UUID, payload: AdminForcePayload, current_user
         logger.error(f"Admin force-close error: {e}")
         raise HTTPException(status_code=400, detail=str(e))
 
+
+# Cancel a session: void unpaid invoices, mark session cancelled and free table
+@router.post("/{session_id}/cancel", response_model=dict)
+def cancel_session(session_id: UUID, current_user=Depends(get_current_user), db: Session = Depends(get_db)):
+    try:
+        current_user_uuid = uuid_module.UUID(current_user["sub"])
+        session = db.query(TableSession).filter(TableSession.id == session_id).one_or_none()
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        assert_venue_access(db, current_user_uuid, session.venue_id, "Not authorized to cancel this session")
+
+        # void any non-paid invoices so they no longer block closure
+        invoices = db.query(SessionInvoice).filter(SessionInvoice.session_id == session_id).filter(SessionInvoice.status != 'paid').all()
+        voided = 0
+        for inv in invoices:
+            inv.status = 'void'
+            db.add(inv)
+            voided += 1
+
+        # mark session cancelled and release table
+        session.status = 'cancelled'
+        session.closed_at = datetime.now(timezone.utc)
+        session.closed_by = current_user_uuid
+        db.add(session)
+        if session.table_id:
+            t = db.query(VenueTable).filter(VenueTable.id == session.table_id).one_or_none()
+            if t:
+                t.status = 'available'
+                db.add(t)
+
+        db.commit()
+
+        return {"cancelled": True, "voided_invoices": voided}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Cancel session error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
 @router.get("/menus/{menu_id}/items", response_model=List[dict])
 def get_menu_items(menu_id: UUID, current_user=Depends(get_current_user), db: Session = Depends(get_db)):
     try:
@@ -635,11 +788,192 @@ def get_menu_items(menu_id: UUID, current_user=Depends(get_current_user), db: Se
             raise HTTPException(status_code=404, detail="Menu not found")
 
         items = db.query(MenuItem).filter(MenuItem.menu_id == menu_id, MenuItem.is_available == True).order_by(MenuItem.sort_order.asc()).all()
-        return [{"id": str(i.id), "name": i.name, "price": float(i.price) if i.price is not None else None, "category": i.category, "image_url": i.image_url} for i in items]
+        return [{"id": str(i.id), "name": i.name, "price": float(i.price) if i.price is not None else None, "category": i.category, "image_url": i.image_url, "description": i.description, "is_available": i.is_available, "dietary_tags": i.dietary_tags, "menu_id": str(i.menu_id)} for i in items]
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Get menu items error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# --- Create / Update / Delete Menus ---
+@router.post("/venue/{venue_id}/menus", response_model=dict)
+def create_menu_for_venue(venue_id: UUID, payload: dict, current_user=Depends(get_current_user), db: Session = Depends(get_db)):
+    try:
+        current_user_uuid = uuid_module.UUID(current_user["sub"])
+        assert_venue_access(db, current_user_uuid, venue_id, "Not authorized to create menus for this venue")
+
+        name = payload.get('name')
+        if not name:
+            raise HTTPException(status_code=400, detail='Menu name is required')
+        description = payload.get('description')
+
+        menu = Menu(venue_id=venue_id, name=name, description=description, is_active=True)
+        db.add(menu)
+        db.commit()
+        db.refresh(menu)
+        return {"id": str(menu.id), "name": menu.name, "description": menu.description, "is_active": menu.is_active}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Create menu error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.patch("/menus/{menu_id}", response_model=dict)
+def update_menu(menu_id: UUID, payload: dict, current_user=Depends(get_current_user), db: Session = Depends(get_db)):
+    try:
+        current_user_uuid = uuid_module.UUID(current_user["sub"])
+        menu = db.query(Menu).filter(Menu.id == menu_id).one_or_none()
+        if not menu:
+            raise HTTPException(status_code=404, detail='Menu not found')
+        assert_venue_access(db, current_user_uuid, menu.venue_id, 'Not authorized to update menu')
+
+        if 'name' in payload:
+            menu.name = payload.get('name')
+        if 'description' in payload:
+            menu.description = payload.get('description')
+        if 'is_active' in payload:
+            menu.is_active = payload.get('is_active')
+        db.add(menu)
+        db.commit()
+        db.refresh(menu)
+        return {"id": str(menu.id), "name": menu.name, "description": menu.description, "is_active": menu.is_active}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Update menu error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete("/menus/{menu_id}", response_model=dict)
+def delete_menu(menu_id: UUID, current_user=Depends(get_current_user), db: Session = Depends(get_db)):
+    try:
+        current_user_uuid = uuid_module.UUID(current_user["sub"])
+        menu = db.query(Menu).filter(Menu.id == menu_id).one_or_none()
+        if not menu:
+            raise HTTPException(status_code=404, detail='Menu not found')
+        assert_venue_access(db, current_user_uuid, menu.venue_id, 'Not authorized to delete menu')
+        db.delete(menu)
+        db.commit()
+        return {"deleted": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Delete menu error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# --- Menu Items CRUD ---
+@router.post("/menus/{menu_id}/items", response_model=dict)
+def create_menu_item(menu_id: UUID, payload: dict, current_user=Depends(get_current_user), db: Session = Depends(get_db)):
+    try:
+        current_user_uuid = uuid_module.UUID(current_user["sub"])
+        menu = db.query(Menu).filter(Menu.id == menu_id).one_or_none()
+        if not menu:
+            raise HTTPException(status_code=404, detail='Menu not found')
+        assert_venue_access(db, current_user_uuid, menu.venue_id, 'Not authorized to add items to this menu')
+
+        name = payload.get('name')
+        if not name:
+            raise HTTPException(status_code=400, detail='Item name is required')
+        # normalize dietary_tags to a Python list of strings (DB expects text[])
+        dtags = payload.get('dietary_tags') or []
+        if isinstance(dtags, str):
+            import json as _json
+            try:
+                dtags = _json.loads(dtags)
+            except Exception:
+                dtags = [dtags]
+        # ensure list of strings
+        if not isinstance(dtags, list):
+            dtags = [dtags]
+        dtags = [str(x) for x in dtags]
+
+        item = MenuItem(
+            menu_id=menu_id,
+            name=name,
+            description=payload.get('description'),
+            price=payload.get('price'),
+            category=payload.get('category'),
+            is_available=payload.get('is_available') if 'is_available' in payload else True,
+            dietary_tags=dtags,
+            image_url=payload.get('image_url'),
+        )
+        db.add(item)
+        db.commit()
+        db.refresh(item)
+        return {"id": str(item.id), "menu_id": str(item.menu_id), "name": item.name, "description": item.description, "price": float(item.price) if item.price is not None else None, "category": item.category, "is_available": item.is_available, "dietary_tags": item.dietary_tags}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Create menu item error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.patch("/menus/items/{item_id}", response_model=dict)
+def update_menu_item(item_id: UUID, payload: dict, current_user=Depends(get_current_user), db: Session = Depends(get_db)):
+    try:
+        current_user_uuid = uuid_module.UUID(current_user["sub"])
+        item = db.query(MenuItem).filter(MenuItem.id == item_id).one_or_none()
+        if not item:
+            raise HTTPException(status_code=404, detail='Menu item not found')
+        menu = db.query(Menu).filter(Menu.id == item.menu_id).one_or_none()
+        if not menu:
+            raise HTTPException(status_code=404, detail='Menu not found for this item')
+        assert_venue_access(db, current_user_uuid, menu.venue_id, 'Not authorized to update menu item')
+
+        for k in ['name','description','price','category','is_available','dietary_tags','image_url']:
+            if k in payload:
+                if k == 'dietary_tags':
+                    dtags = payload.get('dietary_tags') or []
+                    if isinstance(dtags, str):
+                        import json as _json
+                        try:
+                            dtags = _json.loads(dtags)
+                        except Exception:
+                            dtags = [dtags]
+                    if not isinstance(dtags, list):
+                        dtags = [dtags]
+                    dtags = [str(x) for x in dtags]
+                    setattr(item, k, dtags)
+                else:
+                    setattr(item, k, payload.get(k))
+        db.add(item)
+        db.commit()
+        db.refresh(item)
+        return {"id": str(item.id), "menu_id": str(item.menu_id), "name": item.name, "description": item.description, "price": float(item.price) if item.price is not None else None, "category": item.category, "is_available": item.is_available, "dietary_tags": item.dietary_tags}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Update menu item error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete("/menus/items/{item_id}", response_model=dict)
+def delete_menu_item(item_id: UUID, current_user=Depends(get_current_user), db: Session = Depends(get_db)):
+    try:
+        current_user_uuid = uuid_module.UUID(current_user["sub"])
+        item = db.query(MenuItem).filter(MenuItem.id == item_id).one_or_none()
+        if not item:
+            raise HTTPException(status_code=404, detail='Menu item not found')
+        menu = db.query(Menu).filter(Menu.id == item.menu_id).one_or_none()
+        if not menu:
+            raise HTTPException(status_code=404, detail='Menu not found for this item')
+        assert_venue_access(db, current_user_uuid, menu.venue_id, 'Not authorized to delete menu item')
+        db.delete(item)
+        db.commit()
+        return {"deleted": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Delete menu item error: {e}")
         raise HTTPException(status_code=400, detail=str(e))
 
 

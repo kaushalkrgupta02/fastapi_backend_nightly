@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Text, DateTime, Integer, Numeric, Boolean, ForeignKey, JSON
+from sqlalchemy import Column, Text, DateTime, Integer, Numeric, Boolean, ForeignKey, JSON, ARRAY
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from core.get_db import Base
@@ -120,7 +120,7 @@ class MenuItem(Base):
     price = Column(Numeric, nullable=True)
     category = Column(Text, nullable=True)
     is_available = Column(Boolean, nullable=False, default=True)
-    dietary_tags = Column(JSON, nullable=True)
+    dietary_tags = Column(ARRAY(Text), nullable=True, default=list)
     image_url = Column(Text, nullable=True)
     sort_order = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())

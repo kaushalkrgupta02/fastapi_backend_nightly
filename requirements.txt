@@ -9,3 +9,4 @@ email-validator==2.2.0
 supabase==2.15.3
 PyJWT==2.10.1
 python-multipart==0.0.21
+requests==2.31.0

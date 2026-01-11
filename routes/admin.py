@@ -35,7 +35,7 @@ def get_all_venues(current_user = Depends(get_current_user), db: Session = Depen
     try:
         current_user_uuid = uuid_module.UUID(current_user["sub"])
         # print(current_user)
-        if not (is_admin(db, current_user_uuid) or db.query(StaffProfile).filter(StaffProfile.user_id == current_user_uuid).one_or_none()):
+        if not (is_admin(db, current_user_uuid)):
             raise HTTPException(status_code=403, detail="Only admins/venue_manager can view all venues")
 
         venues = db.query(Venue).all()

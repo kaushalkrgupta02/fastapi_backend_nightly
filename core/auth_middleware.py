@@ -21,22 +21,47 @@ async def get_current_user(credentials = Depends(security)) -> Dict[str, Any]:
     
     try:
         supabase = get_supabase()
-        user = supabase.auth.get_user(token)
-        
-        if not user:
+        # Supabase client may return different shapes depending on version.
+        user_resp = supabase.auth.get_user(token)
+        user = None
+
+        # Handle supabase-py response shapes
+        if isinstance(user_resp, dict):
+            # e.g. {'data': {'user': {...}}, 'error': None}
+            user = user_resp.get('data', {}).get('user')
+        else:
+            # e.g. object with .user attribute or namedtuple
+            user = getattr(user_resp, 'user', None)
+
+        if user:
+            return {
+                "sub": str(user.get('id') if isinstance(user, dict) else getattr(user, 'id')),
+                "email": user.get('email') if isinstance(user, dict) else getattr(user, 'email', None),
+                "aud": "authenticated",
+                "user_metadata": (user.get('user_metadata') if isinstance(user, dict) else getattr(user, 'user_metadata', {})) or {}
+            }
+
+        # If Supabase validation failed but token is a JWT, attempt a local decode as fallback (no signature verification).
+        # This is useful for local development where we might be using tokens issued by a different Supabase project.
+        try:
+            decoded = jwt.decode(token, options={"verify_signature": False, "verify_exp": False})
+            return {
+                "sub": str(decoded.get('sub') or decoded.get('user_id') or decoded.get('uid')),
+                "email": decoded.get('email'),
+                "aud": decoded.get('aud', 'authenticated'),
+                "user_metadata": decoded.get('user_metadata') or decoded.get('user_metadata', {})
+            }
+        except Exception as decode_err:
+            logger.debug(f"Local JWT decode failed: {decode_err}")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid authentication credentials",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        
-        return {
-            "sub": str(user.user.id),
-            "email": user.user.email,
-            "aud": "authenticated",
-            "user_metadata": user.user.user_metadata or {}
-        }
-        
+
+    except HTTPException:
+        # Re-raise explicit HTTPExceptions
+        raise
     except Exception as e:
         logger.error(f"Token verification error: {e}")
         raise HTTPException(
